@@ -12,11 +12,14 @@ int main(void)
     }
 
     // Loop principal para sempre receber novas mensagens
-    while (fgets(linha, sizeof(linha), stdin) != NULL) {   // repete enquanto houver linha
+    while (fgets(linha, sizeof(linha), stdin) != NULL)
+    {   // repete enquanto houver linha
         fwrite(linha, 1, strlen(linha), f);                // manda essa linha ao modulo
-        fflush(f);                                         // garante que o envio acontece agora
-    }
 
+        // garante que o envio acontece agora
+        if (fflush(f) != 0)
+            perror("erro");   // mostra o motivo, ex.: Invalid argument    
+    }
     fclose(f);                               // fecha o dispositivo
     return 0;
 }

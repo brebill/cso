@@ -8,6 +8,10 @@
 #include <linux/cdev.h>    // cdev_init, cdev_add: liga o numero do dispositivo as fops
 #include <linux/device.h>  // class_create, device_create: cria o arquivo em /dev
 
+#include <linux/uaccess.h>  // copy_from_user
+
+#include <linux/string.h>   // strncmp
+
 // Nome do dispositivo que o driver vai criar
 #define DEVICE_NAME "pubsub"
 
@@ -48,6 +52,56 @@ static int pubsub_release(struct inode *inodep, struct file *filep)
 // write: o processo escreveu len bytes em buffer (fwrite/echo)
 static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_t len, loff_t *offset)
 {
+    char kbuf[256];
+
+    // linha grande demais
+    if (len >= sizeof(kbuf))
+        return -EINVAL;               
+    
+    // endereço do usuário inválido
+    if (copy_from_user(kbuf, buffer, len))
+        return -EFAULT;                    
+    kbuf[len] = '\0';       // saber quando acaba a string
+    if (len > 0 && kbuf[len - 1] == '\n')
+    kbuf[len - 1] = '\0';    // tira o Enter do fim
+    
+    // /subscribe (entrar na lista X)
+    if (strncmp(kbuf, "/subscribe ", 11) == 0)
+        pr_info("pubsub: subscribe, topico=\"%s\"\n", kbuf + 11);
+
+    // /unsubscribe (sair da lista x)
+    else if (strncmp(kbuf, "/unsubscribe ", 13) == 0)
+        pr_info("pubsub: unsubscribe, topico=\"%s\"\n", kbuf + 13);
+
+
+    // /fetch (escolher topico X para os proximos read
+    else if (strncmp(kbuf, "/fetch ", 7) == 0)
+        pr_info("pubsub: fetch, topico=\"%s\"\n", kbuf + 7);
+
+    // /publish (publicar em X, mensagem "Y")
+      else if (strncmp(kbuf, "/publish ", 9) == 0) {
+        char *topico = kbuf + 9;            // começa depois do comando
+        char *msg = strchr(topico, ' ');    // acha o espaço que separa tópico e mensagem
+        size_t n;
+
+        if (msg == NULL)
+            return -EINVAL;                 // faltou a mensagem
+        *msg = '\0';                        // termina o tópico ali
+        msg++;                              // msg agora aponta para o começo da mensagem
+
+        n = strlen(msg);
+        if (n < 2 || msg[0] != '"' || msg[n - 1] != '"')
+            return -EINVAL;                 // mensagem precisa estar entre aspas
+        msg[n - 1] = '\0';                  // tira a aspa final
+        msg++;                              // pula a aspa inicial
+
+        pr_info("pubsub: publish, topico=\"%s\" msg=\"%s\"\n", topico, msg);
+    }
+
+
+    else
+    return -EINVAL;         // comando descohecido
+
     pr_info("pubsub: write (%zu bytes)\n", len);
     return len;    // "consumi todos os bytes", se devolver 0 o app tenta de novo
 }
