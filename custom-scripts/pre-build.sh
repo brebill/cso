@@ -9,3 +9,4 @@ make -C $BASE_DIR/../modules/param
 make -C $BASE_DIR/../modules/chardrv
 make -C $BASE_DIR/../modules/timerdrv
 make -C $BASE_DIR/../modules/pubsub
+make -C $BASE_DIR/../apps/pubsub-teste
