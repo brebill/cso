@@ -3,14 +3,77 @@
 #include <linux/init.h>	    //module_init, module_exit: funcoes de carga e remocao
 #include <linux/printk.h>   //pr_info, pr_alert: escrevem no log do kernel (dmesg)
 
-// Dispositivo de caracteres (lab2.1)
+// Dispositivo de caracteres (lab2.1) ==============
 #include <linux/fs.h>      // alloc_chrdev_region, struct file_operations, struct file
 #include <linux/cdev.h>    // cdev_init, cdev_add: liga o numero do dispositivo as fops
 #include <linux/device.h>  // class_create, device_create: cria o arquivo em /dev
 
+// ==================================================
+
 #include <linux/uaccess.h>  // copy_from_user
 
 #include <linux/string.h>   // strncmp
+
+// Para fazer a lista encadeada =====================
+
+#include <linux/list.h>     // list_head, LIST_HEAD, list_add_tail: lista ligada do kernel
+#include <linux/slab.h>     // kmalloc, kfree: alocar e liberar memoria no kernel
+
+// tamanho maximo do nome de um topico (com o \0)
+#define TOPIC_NAME_MAX 32
+
+// um topico: o nome + o elo que o liga aos outros na lista
+struct topic {
+    char name[TOPIC_NAME_MAX];
+    struct list_head list;
+};
+
+// cabeca da lista de topicos (comeca vazia)
+static LIST_HEAD(topics);
+
+// LISTA ENCADEADA =======================================
+
+// procura um topico pelo nome na lista, devolve NULL se nao achar
+static struct topic *find_topic(const char *name)
+{
+    struct topic *t;
+
+    list_for_each_entry(t, &topics, list) {
+        if (strcmp(t->name, name) == 0)
+            return t;
+    }
+    return NULL;
+}
+
+// cria um topico novo e coloca no fim da lista, devolve NULL se faltar memoria
+static struct topic *create_topic(const char *name)
+{
+    struct topic *t = kmalloc(sizeof(*t), GFP_KERNEL);   // pede memoria ao kernel
+
+    if (t == NULL)
+        return NULL;                                     // sem memoria
+    strscpy(t->name, name, TOPIC_NAME_MAX);              // copia o nome (cabe e termina com \0)
+    list_add_tail(&t->list, &topics);                    // encaixa no fim da lista
+    return t;
+}
+
+// libera todos os topicos da lista (chamado no exit)
+static void free_topics(void)
+{
+    struct topic *t, *tmp;
+
+    list_for_each_entry_safe(t, tmp, &topics, list) {
+        pr_info("pubsub: liberando topico \"%s\"\n", t->name);
+        list_del(&t->list);                              // tira o topico da lista
+        kfree(t);                                        // devolve a memoria ao kernel
+    }
+}
+
+
+// =============================================================
+
+
+// =====================================================
 
 // Nome do dispositivo que o driver vai criar
 #define DEVICE_NAME "pubsub"
@@ -66,9 +129,23 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
     kbuf[len - 1] = '\0';    // tira o Enter do fim
     
     // /subscribe (entrar na lista X)
-    if (strncmp(kbuf, "/subscribe ", 11) == 0)
-        pr_info("pubsub: subscribe, topico=\"%s\"\n", kbuf + 11);
+    if (strncmp(kbuf, "/subscribe ", 11) == 0) {
+        char *topico = kbuf + 11;
 
+        if (strlen(topico) >= TOPIC_NAME_MAX)
+            return -ENAMETOOLONG;                  // nome nao cabe no topico
+        if (topico[0] == '\0' || strchr(topico, ' '))
+            return -EINVAL;                        // nome vazio ou com espaco
+        if (find_topic(topico) == NULL) {          // ainda nao existe: cria
+            if (create_topic(topico) == NULL)
+                return -ENOMEM;                    // sem memoria
+            pr_info("pubsub: topico \"%s\" criado\n", topico);
+        } else {
+            pr_info("pubsub: topico \"%s\" ja existe\n", topico);
+        }
+    }
+
+    
     // /unsubscribe (sair da lista x)
     else if (strncmp(kbuf, "/unsubscribe ", 13) == 0)
         pr_info("pubsub: unsubscribe, topico=\"%s\"\n", kbuf + 13);
@@ -178,6 +255,10 @@ static int pubsub_init(void)
 // desfaz tudo na ordem inversa do init
 static void pubsub_exit(void)
 {
+
+    // Libera os tópicos criados
+    free_topics();
+
     // desfaz o device (apaga /dev/pubsub), ordem inversa do init
     // assinatura (linux/device.h): void device_destroy(const struct class *cls, dev_t devt);
     device_destroy(cls, devno);
