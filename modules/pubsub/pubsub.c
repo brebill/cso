@@ -45,11 +45,27 @@ static int pubsub_release(struct inode *inodep, struct file *filep)
     return 0;
 }
 
+// write: o processo escreveu len bytes em buffer (fwrite/echo)
+static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_t len, loff_t *offset)
+{
+    pr_info("pubsub: write (%zu bytes)\n", len);
+    return len;    // "consumi todos os bytes", se devolver 0 o app tenta de novo
+}
+
+// read: o processo quer ler (cat/fread)
+static ssize_t pubsub_read(struct file *filep, char __user *buffer, size_t len, loff_t *offset)
+{
+    pr_info("pubsub: read\n");
+    return 0;    // 0 = "nada para ler" (fim de arquivo), o cat termina
+}
+
 // tabela: "quando acontecer X no arquivo, chame a funcao Y"
 static struct file_operations fops =
 {
-    .open = pubsub_open,
-    .release = pubsub_release,
+    .open     = pubsub_open,
+    .release  = pubsub_release,
+    .write    = pubsub_write,
+    .read     = pubsub_read,
 };
 
 // Função para inicializar modulo, com modprobe
