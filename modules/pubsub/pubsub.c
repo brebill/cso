@@ -23,12 +23,21 @@
 
 #include <linux/mutex.h>    // mutex_lock, mutex_unlock: so um processo por vez na lista
 
+#include <linux/sched.h>    // current, task_pid_nr: qual processo esta rodando
+
 // tamanho maximo do nome de um topico (com o \0)
 #define TOPIC_NAME_MAX 32
 
-// um topico: o nome + o elo que o liga aos outros na lista
+// um inscrito: o pid do processo + o elo na lista de inscritos do topico
+struct subscriber {
+    pid_t pid;
+    struct list_head list;
+};
+
+// um topico: o nome + a lista dos seus inscritos + o elo na lista de topicos
 struct topic {
     char name[TOPIC_NAME_MAX];
+    struct list_head subscribers;
     struct list_head list;
 };
 
@@ -59,21 +68,57 @@ static struct topic *create_topic(const char *name)
     if (t == NULL)
         return NULL;                                     // sem memoria
     strscpy(t->name, name, TOPIC_NAME_MAX);              // copia o nome (cabe e termina com \0)
+
+    INIT_LIST_HEAD(&t->subscribers);                     // lista de inscritos comeca vazia 
+
     list_add_tail(&t->list, &topics);                    // encaixa no fim da lista
     return t;
 }
 
-// libera todos os topicos da lista (chamado no exit)
+// procura um inscrito pelo pid na lista do topico, devolve NULL se nao achar (pid disponivel)
+static struct subscriber *find_subscriber(struct topic *t, pid_t pid)
+{
+    struct subscriber *s;
+
+    list_for_each_entry(s, &t->subscribers, list) {
+        if (s->pid == pid)
+            return s;
+    }
+    return NULL;
+}
+
+// cria um inscrito com o pid dado e coloca no fim da lista do topico
+static struct subscriber *add_subscriber(struct topic *t, pid_t pid)
+{
+    struct subscriber *s = kmalloc(sizeof(*s), GFP_KERNEL);
+
+    if (s == NULL)
+        return NULL;                                     // sem memoria
+    s->pid = pid;
+    list_add_tail(&s->list, &t->subscribers);            // encaixa na lista deste topico
+    return s;
+}
+
+// libera todos os topicos da lista, e os inscritos de cada um (chamado no exit)
 static void free_topics(void)
 {
     struct topic *t, *tmp;
+    struct subscriber *s, *stmp;
 
-    list_for_each_entry_safe(t, tmp, &topics, list) {
+    list_for_each_entry_safe(t, tmp, &topics, list) 
+    {
         pr_info("pubsub: liberando topico \"%s\"\n", t->name);
+
+        list_for_each_entry_safe(s, stmp, &t->subscribers, list) {
+            list_del(&s->list);                          // tira o inscrito da lista do topico
+            kfree(s);                                    // devolve a memoria do inscrito
+        }
+
         list_del(&t->list);                              // tira o topico da lista
-        kfree(t);                                        // devolve a memoria ao kernel
+        kfree(t);                                        // devolve a memoria do topico
     }
 }
+
 
 // debug: imprime todos os topicos da lista (chamar com o mutex pego)
 static void print_topics(void)
@@ -82,7 +127,11 @@ static void print_topics(void)
     int n = 0;
 
     list_for_each_entry(t, &topics, list) {
+        struct subscriber *s;
+
         pr_info("pubsub:   topico \"%s\"\n", t->name);
+        list_for_each_entry(s, &t->subscribers, list)
+            pr_info("pubsub:     pid %d\n", s->pid);
         n++;
     }
     pr_info("pubsub: total %d topico(s)\n", n);
@@ -148,6 +197,10 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
     if (strncmp(kbuf, "/subscribe ", 11) == 0) {
         char *topico = kbuf + 11;
 
+        struct topic *t;
+        int created = 0;                                   // 1 se este subscribe criou o topico
+        pid_t pid = task_pid_nr(current);                  // quem esta fazendo o subscribe
+
         // nome nao cabe no topico
         if (strlen(topico) >= TOPIC_NAME_MAX)
             return -ENAMETOOLONG;                 
@@ -156,18 +209,33 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         if (topico[0] == '\0' || strchr(topico, ' '))
             return -EINVAL;                       
 
-        // cria o topico se nao existir; o mutex evita a condicao de corrida
-        // (dois processos criarem o mesmo topico ao mesmo tempo)
+        // acha o topico (ou cria) e inscreve o processo; tudo com o mutex
         mutex_lock(&topics_lock);                          // pega a chave
-        if (find_topic(topico) == NULL) {
-            if (create_topic(topico) == NULL) {
+        t = find_topic(topico);
+        if (t == NULL) {
+            t = create_topic(topico);
+            if (t == NULL) {
                 mutex_unlock(&topics_lock);                // devolve a chave antes de sair
                 return -ENOMEM;                            // sem memoria
             }
+            created = 1;
             pr_info("pubsub: topico \"%s\" criado\n", topico);
-        } else {
-            pr_info("pubsub: topico \"%s\" ja existe\n", topico);
         }
+
+        if (find_subscriber(t, pid) == NULL) {             // ainda nao esta inscrito
+            if (add_subscriber(t, pid) == NULL) {
+                if (created) {                             // nao deixa topico vazio na lista
+                    list_del(&t->list);
+                    kfree(t);
+                }
+                mutex_unlock(&topics_lock);                // devolve a chave antes de sair
+                return -ENOMEM;                            // sem memoria
+            }
+            pr_info("pubsub: pid %d inscrito em \"%s\"\n", pid, topico);
+        } else {
+            pr_info("pubsub: pid %d ja inscrito em \"%s\"\n", pid, topico);
+        }
+
         print_topics();                                    // debug: mostra a lista
         mutex_unlock(&topics_lock);                        // devolve a chave
     }
