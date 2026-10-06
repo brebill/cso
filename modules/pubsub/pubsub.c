@@ -14,10 +14,14 @@
 
 #include <linux/string.h>   // strncmp
 
-// Para fazer a lista encadeada =====================
+//=====================================
+// LISTA ENCADEADA DE TOPICOS
+//=====================================
 
 #include <linux/list.h>     // list_head, LIST_HEAD, list_add_tail: lista ligada do kernel
 #include <linux/slab.h>     // kmalloc, kfree: alocar e liberar memoria no kernel
+
+#include <linux/mutex.h>    // mutex_lock, mutex_unlock: so um processo por vez na lista
 
 // tamanho maximo do nome de um topico (com o \0)
 #define TOPIC_NAME_MAX 32
@@ -28,10 +32,12 @@ struct topic {
     struct list_head list;
 };
 
+
 // cabeca da lista de topicos (comeca vazia)
 static LIST_HEAD(topics);
 
-// LISTA ENCADEADA =======================================
+// chave que protege a lista de topicos (so quem tem a chave mexe nela)
+static DEFINE_MUTEX(topics_lock);
 
 // procura um topico pelo nome na lista, devolve NULL se nao achar
 static struct topic *find_topic(const char *name)
@@ -69,11 +75,21 @@ static void free_topics(void)
     }
 }
 
+// debug: imprime todos os topicos da lista (chamar com o mutex pego)
+static void print_topics(void)
+{
+    struct topic *t;
+    int n = 0;
 
-// =============================================================
+    list_for_each_entry(t, &topics, list) {
+        pr_info("pubsub:   topico \"%s\"\n", t->name);
+        n++;
+    }
+    pr_info("pubsub: total %d topico(s)\n", n);
+}
 
 
-// =====================================================
+// ====================================================
 
 // Nome do dispositivo que o driver vai criar
 #define DEVICE_NAME "pubsub"
@@ -132,20 +148,30 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
     if (strncmp(kbuf, "/subscribe ", 11) == 0) {
         char *topico = kbuf + 11;
 
+        // nome nao cabe no topico
         if (strlen(topico) >= TOPIC_NAME_MAX)
-            return -ENAMETOOLONG;                  // nome nao cabe no topico
+            return -ENAMETOOLONG;                 
+
+        // nome vazio ou com espaco
         if (topico[0] == '\0' || strchr(topico, ' '))
-            return -EINVAL;                        // nome vazio ou com espaco
-        if (find_topic(topico) == NULL) {          // ainda nao existe: cria
-            if (create_topic(topico) == NULL)
-                return -ENOMEM;                    // sem memoria
+            return -EINVAL;                       
+
+        // cria o topico se nao existir; o mutex evita a condicao de corrida
+        // (dois processos criarem o mesmo topico ao mesmo tempo)
+        mutex_lock(&topics_lock);                          // pega a chave
+        if (find_topic(topico) == NULL) {
+            if (create_topic(topico) == NULL) {
+                mutex_unlock(&topics_lock);                // devolve a chave antes de sair
+                return -ENOMEM;                            // sem memoria
+            }
             pr_info("pubsub: topico \"%s\" criado\n", topico);
         } else {
             pr_info("pubsub: topico \"%s\" ja existe\n", topico);
         }
+        print_topics();                                    // debug: mostra a lista
+        mutex_unlock(&topics_lock);                        // devolve a chave
     }
 
-    
     // /unsubscribe (sair da lista x)
     else if (strncmp(kbuf, "/unsubscribe ", 13) == 0)
         pr_info("pubsub: unsubscribe, topico=\"%s\"\n", kbuf + 13);
