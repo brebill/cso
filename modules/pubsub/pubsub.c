@@ -67,6 +67,18 @@ static struct topic *find_topic(const char *name)
     return NULL;
 }
 
+// 1 se t ainda e um topico da lista, 0 se nao (so compara enderecos, nunca le t)
+static int topic_exists(const struct topic *t)
+{
+    struct topic *p;
+
+    list_for_each_entry(p, &topics, list) {
+        if (p == t)
+            return 1;
+    }
+    return 0;
+}
+
 // cria um topico novo e coloca no fim da lista, devolve NULL se faltar memoria
 static struct topic *create_topic(const char *name)
 {
@@ -135,6 +147,30 @@ static int queue_message(struct subscriber *s, const char *text)
     return 0;
 }
 
+// tira um inscrito da lista do topico e devolve a memoria dele (fila primeiro, depois a struct)
+static void remove_subscriber(struct subscriber *s)
+{
+    free_messages(s);                                    // libera a fila do inscrito
+    list_del(&s->list);                                  // tira da lista do topico
+    kfree(s);                                            // devolve a memoria do inscrito
+}
+
+// tira o pid do topico; se o topico ficar sem inscritos, apaga o topico tambem
+// devolve 0, ou -ENOENT se o pid nao estava inscrito (chamar com o mutex pego; t pode ser liberado aqui)
+static int unsubscribe_pid(struct topic *t, pid_t pid)
+{
+    struct subscriber *s = find_subscriber(t, pid);
+
+    if (s == NULL)
+        return -ENOENT;
+    remove_subscriber(s);
+    if (list_empty(&t->subscribers)) {                   // ultimo inscrito saiu
+        list_del(&t->list);
+        kfree(t);
+    }
+    return 0;
+}
+
 // libera todos os topicos da lista, e os inscritos de cada um (chamado no exit)
 static void free_topics(void)
 {
@@ -145,11 +181,8 @@ static void free_topics(void)
     {
         pr_info("pubsub: liberando topico \"%s\"\n", t->name);
 
-        list_for_each_entry_safe(s, stmp, &t->subscribers, list) {
-            free_messages(s);                            // libera a fila do inscrito
-            list_del(&s->list);                          // tira o inscrito da lista do topico
-            kfree(s);                                    // devolve a memoria do inscrito
-        }
+        list_for_each_entry_safe(s, stmp, &t->subscribers, list)
+            remove_subscriber(s);
 
         list_del(&t->list);                              // tira o topico da lista
         kfree(t);                                        // devolve a memoria do topico
@@ -211,7 +244,16 @@ static int pubsub_open(struct inode *inodep, struct file *filep)
 // release: o processo fechou o arquivo (fclose)
 static int pubsub_release(struct inode *inodep, struct file *filep)
 {
+    struct topic *t, *tmp;
+    pid_t pid = task_pid_nr(current);
+
     pr_info("pubsub: release\n");
+
+    // tira o pid de todos os topicos; os que ficarem vazios somem (_safe: t pode ser liberado)
+    mutex_lock(&topics_lock);
+    list_for_each_entry_safe(t, tmp, &topics, list)
+        unsubscribe_pid(t, pid);                           // -ENOENT (nao estava la) e ignorado
+    mutex_unlock(&topics_lock);
     return 0;
 }
 
@@ -279,8 +321,31 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
     }
 
     // /unsubscribe (sair da lista x)
-    else if (strncmp(kbuf, "/unsubscribe ", 13) == 0)
-        pr_info("pubsub: unsubscribe, topico=\"%s\"\n", kbuf + 13);
+    else if (strncmp(kbuf, "/unsubscribe ", 13) == 0) {
+        char *topico = kbuf + 13;
+        struct topic *t;
+        int ret;
+
+        // nome vazio ou com espaco
+        if (topico[0] == '\0' || strchr(topico, ' '))
+            return -EINVAL;
+
+        mutex_lock(&topics_lock);
+        t = find_topic(topico);
+        if (t == NULL) {
+            mutex_unlock(&topics_lock);                    // devolve a chave antes de sair
+            return -ENOENT;                                // topico nao existe
+        }
+        if (filep->private_data == t)                      // so compara o endereco, nao usa o topico
+            filep->private_data = NULL;                    // este arquivo deixa de apontar p/ ele (t pode ser liberado)
+        ret = unsubscribe_pid(t, task_pid_nr(current));    // -ENOENT se nao estava inscrito
+        if (ret == 0)
+            print_topics();                                // debug: mostra a lista
+        mutex_unlock(&topics_lock);
+        if (ret != 0)
+            return ret;
+        pr_info("pubsub: unsubscribe, topico=\"%s\"\n", topico);
+    }
 
 
     // /fetch (escolher topico X para os proximos read
@@ -362,6 +427,11 @@ static ssize_t pubsub_read(struct file *filep, char __user *buffer, size_t len, 
         return -EINVAL;                                    // nao fez /fetch ainda
 
     mutex_lock(&topics_lock);
+    if (!topic_exists(t)) {                                // o topico foi apagado depois do /fetch
+        mutex_unlock(&topics_lock);
+        filep->private_data = NULL;
+        return -EINVAL;                                    // precisa de novo /fetch
+    }
     s = find_subscriber(t, task_pid_nr(current));
     if (s == NULL || list_empty(&s->msgs)) {
         mutex_unlock(&topics_lock);
