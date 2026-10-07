@@ -28,9 +28,16 @@
 // tamanho maximo do nome de um topico (com o \0)
 #define TOPIC_NAME_MAX 32
 
-// um inscrito: o pid do processo + o elo na lista de inscritos do topico
+// uma mensagem: o texto (alocado do tamanho exato) + o elo na fila do inscrito
+struct message {
+    char *text;
+    struct list_head list;
+};
+
+// um inscrito: o pid do processo + a fila de mensagens + o elo na lista de inscritos do topico
 struct subscriber {
     pid_t pid;
+    struct list_head msgs;      // fila de mensagens deste inscrito
     struct list_head list;
 };
 
@@ -95,8 +102,37 @@ static struct subscriber *add_subscriber(struct topic *t, pid_t pid)
     if (s == NULL)
         return NULL;                                     // sem memoria
     s->pid = pid;
+    INIT_LIST_HEAD(&s->msgs);                            // fila comeca vazia
     list_add_tail(&s->list, &t->subscribers);            // encaixa na lista deste topico
     return s;
+}
+
+// libera todas as mensagens da fila de um inscrito
+static void free_messages(struct subscriber *s)
+{
+    struct message *m, *tmp;
+
+    list_for_each_entry_safe(m, tmp, &s->msgs, list) {
+        list_del(&m->list);                              // tira da fila
+        kfree(m->text);                                  // libera o texto
+        kfree(m);                                        // libera a struct
+    }
+}
+
+// copia o texto e poe a mensagem no fim da fila do inscrito, devolve 0 ou -ENOMEM
+static int queue_message(struct subscriber *s, const char *text)
+{
+    struct message *m = kmalloc(sizeof(*m), GFP_KERNEL);
+
+    if (m == NULL)
+        return -ENOMEM;
+    m->text = kstrdup(text, GFP_KERNEL);                 // copia: o kbuf do write e local
+    if (m->text == NULL) {
+        kfree(m);                                        // desfaz o bloco 1
+        return -ENOMEM;
+    }
+    list_add_tail(&m->list, &s->msgs);                   // encaixa no fim da fila
+    return 0;
 }
 
 // libera todos os topicos da lista, e os inscritos de cada um (chamado no exit)
@@ -110,6 +146,7 @@ static void free_topics(void)
         pr_info("pubsub: liberando topico \"%s\"\n", t->name);
 
         list_for_each_entry_safe(s, stmp, &t->subscribers, list) {
+            free_messages(s);                            // libera a fila do inscrito
             list_del(&s->list);                          // tira o inscrito da lista do topico
             kfree(s);                                    // devolve a memoria do inscrito
         }
@@ -167,6 +204,7 @@ MODULE_DESCRIPTION("T2");
 static int pubsub_open(struct inode *inodep, struct file *filep)
 {
     pr_info("pubsub: open\n");
+    filep->private_data = NULL;                            // nenhum topico escolhido ainda
     return 0;
 }
 
@@ -246,14 +284,35 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
 
 
     // /fetch (escolher topico X para os proximos read
-    else if (strncmp(kbuf, "/fetch ", 7) == 0)
-        pr_info("pubsub: fetch, topico=\"%s\"\n", kbuf + 7);
+    else if (strncmp(kbuf, "/fetch ", 7) == 0) {
+        char *topico = kbuf + 7;
+        struct topic *t;
+
+        // nome vazio ou com espaco
+        if (topico[0] == '\0' || strchr(topico, ' '))
+            return -EINVAL;
+
+        mutex_lock(&topics_lock);
+        t = find_topic(topico);
+        if (t == NULL) {
+            mutex_unlock(&topics_lock);                    // devolve a chave antes de sair
+            return -ENOENT;                                // topico nao existe
+        }
+        if (find_subscriber(t, task_pid_nr(current)) == NULL) {
+            mutex_unlock(&topics_lock);
+            return -EPERM;                                 // nao esta inscrito nele
+        }
+        filep->private_data = t;                           // proximos read leem deste topico
+        mutex_unlock(&topics_lock);
+        pr_info("pubsub: fetch, topico=\"%s\"\n", topico);
+    }
 
     // /publish (publicar em X, mensagem "Y")
       else if (strncmp(kbuf, "/publish ", 9) == 0) {
         char *topico = kbuf + 9;            // começa depois do comando
         char *msg = strchr(topico, ' ');    // acha o espaço que separa tópico e mensagem
         size_t n;
+        struct topic *t;
 
         if (msg == NULL)
             return -EINVAL;                 // faltou a mensagem
@@ -266,7 +325,21 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         msg[n - 1] = '\0';                  // tira a aspa final
         msg++;                              // pula a aspa inicial
 
-        pr_info("pubsub: publish, topico=\"%s\" msg=\"%s\"\n", topico, msg);
+        // acha o topico e poe a mensagem na fila de cada inscrito; tudo com o mutex
+        mutex_lock(&topics_lock);
+        t = find_topic(topico);
+        if (t != NULL) {                                   // topico inexistente: ignora
+            struct subscriber *s;
+
+            list_for_each_entry(s, &t->subscribers, list) {
+                if (queue_message(s, msg) != 0) {
+                    mutex_unlock(&topics_lock);            // devolve a chave antes de sair
+                    return -ENOMEM;                        // sem memoria
+                }
+                pr_info("pubsub: msg \"%s\" na fila do pid %d\n", msg, s->pid);
+            }
+        }
+        mutex_unlock(&topics_lock);
     }
 
 
@@ -280,8 +353,39 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
 // read: o processo quer ler (cat/fread)
 static ssize_t pubsub_read(struct file *filep, char __user *buffer, size_t len, loff_t *offset)
 {
-    pr_info("pubsub: read\n");
-    return 0;    // 0 = "nada para ler" (fim de arquivo), o cat termina
+    struct topic *t = filep->private_data;                 // topico escolhido no /fetch
+    struct subscriber *s;
+    struct message *m;
+    size_t n;
+
+    if (t == NULL)
+        return -EINVAL;                                    // nao fez /fetch ainda
+
+    mutex_lock(&topics_lock);
+    s = find_subscriber(t, task_pid_nr(current));
+    if (s == NULL || list_empty(&s->msgs)) {
+        mutex_unlock(&topics_lock);
+        return 0;                                          // fila vazia: nada para ler
+    }
+
+    m = list_first_entry(&s->msgs, struct message, list);  // a mais antiga
+    n = strlen(m->text);
+    if (n > len) {
+        mutex_unlock(&topics_lock);
+        return -EMSGSIZE;                                  // nao cabe no buffer do usuario; fica na fila
+    }
+    if (copy_to_user(buffer, m->text, n)) {
+        mutex_unlock(&topics_lock);
+        return -EFAULT;                                    // endereco invalido; fica na fila
+    }
+
+    list_del(&m->list);                                    // so tira da fila depois de entregar
+    kfree(m->text);
+    kfree(m);
+    mutex_unlock(&topics_lock);
+
+    pr_info("pubsub: read, %zu bytes entregues ao pid %d\n", n, task_pid_nr(current));
+    return n;
 }
 
 // tabela: "quando acontecer X no arquivo, chame a funcao Y"
