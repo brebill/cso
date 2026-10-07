@@ -1,4 +1,4 @@
-//bibliotecas basicas 
+//bibliotecas basicas
 #include <linux/module.h>   //MODULE_*: MODULE_LICENSE, MODULE_AUTHOR...
 #include <linux/init.h>	    //module_init, module_exit: funcoes de carga e remocao
 #include <linux/printk.h>   //pr_info, pr_alert: escrevem no log do kernel (dmesg)
@@ -55,7 +55,6 @@ struct topic {
     int max_subscribers;                 // limite de inscritos, lido e escrito pelo sysfs
     struct kobj_attribute attr;          // o arquivo deste topico em /sys/pubsub
 };
-
 
 // cabeca da lista de topicos (comeca vazia)
 static LIST_HEAD(topics);
@@ -247,7 +246,7 @@ static void free_topics(void)
     struct topic *t, *tmp;
     struct subscriber *s, *stmp;
 
-    list_for_each_entry_safe(t, tmp, &topics, list) 
+    list_for_each_entry_safe(t, tmp, &topics, list)
     {
         pr_info("pubsub: liberando topico \"%s\"\n", t->name);
 
@@ -257,25 +256,6 @@ static void free_topics(void)
         delete_topic(t);
     }
 }
-
-
-// debug: imprime todos os topicos da lista (chamar com o mutex pego)
-static void print_topics(void)
-{
-    struct topic *t;
-    int n = 0;
-
-    list_for_each_entry(t, &topics, list) {
-        struct subscriber *s;
-
-        pr_info("pubsub:   topico \"%s\"\n", t->name);
-        list_for_each_entry(s, &t->subscribers, list)
-            pr_info("pubsub:     pid %d\n", s->pid);
-        n++;
-    }
-    pr_info("pubsub: total %d topico(s), contador %d\n", n, topic_count);
-}
-
 
 // ====================================================
 
@@ -299,8 +279,8 @@ static struct device *dev = NULL;
 
 // informacoes do modulo (modinfo)
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Pedro Oliveira");
-MODULE_DESCRIPTION("T2");
+MODULE_AUTHOR("Pedro Oliveira, Brenda Billmann");
+MODULE_DESCRIPTION("T2: broker publish/subscribe em /dev/pubsub");
 
 // maximo de topicos existindo ao mesmo tempo (definido na carga: modprobe pubsub max_topicos=2)
 static int max_topicos = 8;
@@ -338,15 +318,15 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
 
     // linha grande demais
     if (len >= sizeof(kbuf))
-        return -EINVAL;               
-    
+        return -EINVAL;
+
     // endereço do usuário inválido
     if (copy_from_user(kbuf, buffer, len))
-        return -EFAULT;                    
+        return -EFAULT;
     kbuf[len] = '\0';       // saber quando acaba a string
     if (len > 0 && kbuf[len - 1] == '\n')
-    kbuf[len - 1] = '\0';    // tira o Enter do fim
-    
+        kbuf[len - 1] = '\0';    // tira o Enter do fim
+
     // /subscribe (entrar na lista X)
     if (strncmp(kbuf, "/subscribe ", 11) == 0) {
         char *topico = kbuf + 11;
@@ -357,11 +337,11 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
 
         // nome nao cabe no topico
         if (strlen(topico) >= TOPIC_NAME_MAX)
-            return -ENAMETOOLONG;                 
+            return -ENAMETOOLONG;
 
         // nome vazio, com espaco ou com barra (nao cabe em nome de arquivo do sysfs)
         if (topico[0] == '\0' || strchr(topico, ' ') || strchr(topico, '/'))
-            return -EINVAL;                       
+            return -EINVAL;
 
         // acha o topico (ou cria) e inscreve o processo; tudo com o mutex
         mutex_lock(&topics_lock);                          // pega a chave
@@ -378,7 +358,7 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
                 return -ENOMEM;                            // sem memoria
             }
             created = 1;
-            pr_info("pubsub: topico \"%s\" criado\n", topico);
+            pr_info("pubsub: topico \"%s\" criado (%d de %d)\n", topico, topic_count, max_topicos);
         }
 
         if (find_subscriber(t, pid) == NULL) {             // ainda nao esta inscrito
@@ -398,11 +378,10 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
             pr_info("pubsub: pid %d ja inscrito em \"%s\"\n", pid, topico);
         }
 
-        print_topics();                                    // debug: mostra a lista
         mutex_unlock(&topics_lock);                        // devolve a chave
     }
 
-    // /unsubscribe (sair da lista x)
+    // /unsubscribe (sair da lista X)
     else if (strncmp(kbuf, "/unsubscribe ", 13) == 0) {
         char *topico = kbuf + 13;
         struct topic *t;
@@ -421,16 +400,13 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         if (filep->private_data == t)                      // so compara o endereco, nao usa o topico
             filep->private_data = NULL;                    // este arquivo deixa de apontar p/ ele (t pode ser liberado)
         ret = unsubscribe_pid(t, task_pid_nr(current));    // -ENOENT se nao estava inscrito
-        if (ret == 0)
-            print_topics();                                // debug: mostra a lista
         mutex_unlock(&topics_lock);
         if (ret != 0)
             return ret;
         pr_info("pubsub: unsubscribe, topico=\"%s\"\n", topico);
     }
 
-
-    // /fetch (escolher topico X para os proximos read
+    // /fetch (escolher topico X para os proximos read)
     else if (strncmp(kbuf, "/fetch ", 7) == 0) {
         char *topico = kbuf + 7;
         struct topic *t;
@@ -455,7 +431,7 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
     }
 
     // /publish (publicar em X, mensagem "Y")
-      else if (strncmp(kbuf, "/publish ", 9) == 0) {
+    else if (strncmp(kbuf, "/publish ", 9) == 0) {
         char *topico = kbuf + 9;            // começa depois do comando
         char *msg = strchr(topico, ' ');    // acha o espaço que separa tópico e mensagem
         size_t n;
@@ -477,23 +453,23 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         t = find_topic(topico);
         if (t != NULL) {                                   // topico inexistente: ignora
             struct subscriber *s;
+            int enviadas = 0;
 
             list_for_each_entry(s, &t->subscribers, list) {
                 if (queue_message(s, msg) != 0) {
                     mutex_unlock(&topics_lock);            // devolve a chave antes de sair
                     return -ENOMEM;                        // sem memoria
                 }
-                pr_info("pubsub: msg \"%s\" na fila do pid %d\n", msg, s->pid);
+                enviadas++;
             }
+            pr_info("pubsub: publish em \"%s\": %d inscrito(s)\n", topico, enviadas);
         }
         mutex_unlock(&topics_lock);
     }
 
-
     else
-    return -EINVAL;         // comando descohecido
+        return -EINVAL;         // comando desconhecido
 
-    pr_info("pubsub: write (%zu bytes)\n", len);
     return len;    // "consumi todos os bytes", se devolver 0 o app tenta de novo
 }
 
@@ -613,7 +589,6 @@ static int pubsub_init(void)
     return 0;
 }
 
-
 // Função para finalizar modulo, com rmmod
 // desfaz tudo na ordem inversa do init
 static void pubsub_exit(void)
@@ -629,7 +604,6 @@ static void pubsub_exit(void)
     // assinatura (linux/device.h): void device_destroy(const struct class *cls, dev_t devt);
     device_destroy(cls, devno);
 
-
     // desfaz a classe (apaga /sys/class/pubsub)
     // assinatura (linux/device/class.h): void class_destroy(const struct class *cls);
     class_destroy(cls);
@@ -642,7 +616,6 @@ static void pubsub_exit(void)
 
     pr_info("pubsub: removido\n");
 }
-
 
 module_init(pubsub_init);
 module_exit(pubsub_exit);
