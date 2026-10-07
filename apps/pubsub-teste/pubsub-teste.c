@@ -15,6 +15,10 @@ int main(void)
     // Loop principal para sempre receber novas mensagens
     while (fgets(linha, sizeof(linha), stdin) != NULL)
     {   // repete enquanto houver linha
+        // /quit e local: sai do laco e cai no fclose
+        if (strcmp(linha, "/quit\n") == 0)
+            break;
+
         // /read e local: nao vai ao modulo, le a proxima mensagem do topico do /fetch
         if (strcmp(linha, "/read\n") == 0) {
             char msg[256];
