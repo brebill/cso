@@ -1,0 +1,2 @@
+# username uid group gid password home shell groups comment
+user1 -1 users -1 =root /home/user1 /bin/sh - First User
