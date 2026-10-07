@@ -25,6 +25,9 @@
 
 #include <linux/sched.h>    // current, task_pid_nr: qual processo esta rodando
 
+#include <linux/kobject.h>  // kobject_create_and_add, kobject_put: pasta em /sys
+#include <linux/sysfs.h>    // sysfs_create_file, kobj_attribute: arquivos dentro da pasta
+
 // tamanho maximo do nome de um topico (com o \0)
 #define TOPIC_NAME_MAX 32
 
@@ -41,11 +44,16 @@ struct subscriber {
     struct list_head list;
 };
 
+// limite inicial de inscritos de um topico novo (depois muda por /sys/pubsub/<topico>)
+#define DEFAULT_MAX_SUBS 8
+
 // um topico: o nome + a lista dos seus inscritos + o elo na lista de topicos
 struct topic {
     char name[TOPIC_NAME_MAX];
     struct list_head subscribers;
     struct list_head list;
+    int max_subscribers;                 // limite de inscritos, lido e escrito pelo sysfs
+    struct kobj_attribute attr;          // o arquivo deste topico em /sys/pubsub
 };
 
 
@@ -57,6 +65,9 @@ static DEFINE_MUTEX(topics_lock);
 
 // quantos topicos existem agora (mexer so com o mutex pego)
 static int topic_count = 0;
+
+// a pasta /sys/pubsub, onde cada topico tem o seu arquivo de configuracao (criada no init)
+static struct kobject *pubsub_kobj = NULL;
 
 // procura um topico pelo nome na lista, devolve NULL se nao achar
 static struct topic *find_topic(const char *name)
@@ -82,6 +93,31 @@ static int topic_exists(const struct topic *t)
     return 0;
 }
 
+// sysfs, cat /sys/pubsub/<topico>: mostra o limite de inscritos
+// NAO pega o topics_lock: o sysfs_remove_file (chamado com o lock pego) espera este callback acabar
+static ssize_t max_subs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct topic *t = container_of(attr, struct topic, attr);   // acha o topico a partir do atributo
+
+    return sysfs_emit(buf, "%d\n", READ_ONCE(t->max_subscribers));
+}
+
+// sysfs, echo N > /sys/pubsub/<topico>: muda o limite (nao expulsa ninguem)
+static ssize_t max_subs_store(struct kobject *kobj, struct kobj_attribute *attr,
+                              const char *buf, size_t count)
+{
+    struct topic *t = container_of(attr, struct topic, attr);
+    int val;
+    int err = kstrtoint(buf, 10, &val);                         // aceita "3" e "3\n"
+
+    if (err)
+        return err;                                             // nao e numero
+    if (val < 0)
+        return -EINVAL;
+    WRITE_ONCE(t->max_subscribers, val);
+    return count;
+}
+
 // cria um topico novo e coloca no fim da lista, devolve NULL se faltar memoria
 static struct topic *create_topic(const char *name)
 {
@@ -91,7 +127,19 @@ static struct topic *create_topic(const char *name)
         return NULL;                                     // sem memoria
     strscpy(t->name, name, TOPIC_NAME_MAX);              // copia o nome (cabe e termina com \0)
 
-    INIT_LIST_HEAD(&t->subscribers);                     // lista de inscritos comeca vazia 
+    INIT_LIST_HEAD(&t->subscribers);                     // lista de inscritos comeca vazia
+    t->max_subscribers = DEFAULT_MAX_SUBS;               // kmalloc devolve lixo: preenche o limite
+
+    // arquivo /sys/pubsub/<nome>: cat mostra o limite, echo N muda
+    sysfs_attr_init(&t->attr.attr);                      // obrigatorio em atributo alocado dinamicamente
+    t->attr.attr.name = t->name;                         // o arquivo se chama como o topico
+    t->attr.attr.mode = 0660;
+    t->attr.show = max_subs_show;
+    t->attr.store = max_subs_store;
+    if (sysfs_create_file(pubsub_kobj, &t->attr.attr) != 0) {
+        kfree(t);                                        // nao deixa topico sem arquivo
+        return NULL;
+    }
 
     list_add_tail(&t->list, &topics);                    // encaixa no fim da lista
     topic_count++;
@@ -101,6 +149,7 @@ static struct topic *create_topic(const char *name)
 // tira o topico da lista e devolve a memoria dele (os inscritos ja devem ter saido)
 static void delete_topic(struct topic *t)
 {
+    sysfs_remove_file(pubsub_kobj, &t->attr.attr);       // antes do kfree: espera os callbacks acabarem
     list_del(&t->list);
     topic_count--;
     kfree(t);
@@ -116,6 +165,17 @@ static struct subscriber *find_subscriber(struct topic *t, pid_t pid)
             return s;
     }
     return NULL;
+}
+
+// quantos inscritos o topico tem agora (chamar com o mutex pego)
+static int count_subscribers(struct topic *t)
+{
+    struct subscriber *s;
+    int n = 0;
+
+    list_for_each_entry(s, &t->subscribers, list)
+        n++;
+    return n;
 }
 
 // cria um inscrito com o pid dado e coloca no fim da lista do topico
@@ -299,8 +359,8 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         if (strlen(topico) >= TOPIC_NAME_MAX)
             return -ENAMETOOLONG;                 
 
-        // nome vazio ou com espaco
-        if (topico[0] == '\0' || strchr(topico, ' '))
+        // nome vazio, com espaco ou com barra (nao cabe em nome de arquivo do sysfs)
+        if (topico[0] == '\0' || strchr(topico, ' ') || strchr(topico, '/'))
             return -EINVAL;                       
 
         // acha o topico (ou cria) e inscreve o processo; tudo com o mutex
@@ -322,6 +382,11 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         }
 
         if (find_subscriber(t, pid) == NULL) {             // ainda nao esta inscrito
+            if (count_subscribers(t) >= READ_ONCE(t->max_subscribers)) {   // topico cheio: ignora
+                mutex_unlock(&topics_lock);
+                pr_info("pubsub: topico \"%s\" cheio, pid %d ignorado\n", topico, pid);
+                return len;                                // ignorado em silencio: write devolve sucesso
+            }
             if (add_subscriber(t, pid) == NULL) {
                 if (created)                               // nao deixa topico vazio na lista
                     delete_topic(t);
@@ -487,11 +552,21 @@ static struct file_operations fops =
 // Função para inicializar modulo, com modprobe
 static int pubsub_init(void)
 {
+    int err;
+
+    // cria /sys/pubsub (NULL = direto em /sys, sem pasta pai)
+    pubsub_kobj = kobject_create_and_add("pubsub", NULL);
+    if (pubsub_kobj == NULL) {
+        pr_alert("pubsub: falhou ao criar /sys/pubsub\n");
+        return -ENOMEM;
+    }
+
     // pede ao kernel um major livre e o minor 0, o numero fica em devno
-    int err = alloc_chrdev_region(&devno, 0, DEVCOUNT, DEVICE_NAME);
+    err = alloc_chrdev_region(&devno, 0, DEVCOUNT, DEVICE_NAME);
     // se nao conseguir, devolve o erro e o modprobe falha
     if (err != 0) {
         pr_alert("pubsub: falhou ao registrar o numero do dispositivo\n");
+        kobject_put(pubsub_kobj);                    // desfaz o /sys/pubsub
         return err;
     }
 
@@ -503,6 +578,7 @@ static int pubsub_init(void)
     if (err != 0) {
         pr_alert("pubsub: falhou ao adicionar o dispositivo\n");
         unregister_chrdev_region(devno, DEVCOUNT);   // desfaz o alloc de cima
+        kobject_put(pubsub_kobj);                    // desfaz o /sys/pubsub
         return err;
     }
 
@@ -513,6 +589,7 @@ static int pubsub_init(void)
     if (IS_ERR(cls)) {
         pr_alert("pubsub: falhou ao criar a classe\n");
         err = PTR_ERR(cls);                          // tira o codigo de erro de dentro do ponteiro
+        kobject_put(pubsub_kobj);                    // desfaz o /sys/pubsub
         cdev_del(&pubsub_cdev);                      // desfaz o cdev_add
         unregister_chrdev_region(devno, DEVCOUNT);   // desfaz o alloc
         return err;
@@ -524,6 +601,7 @@ static int pubsub_init(void)
     if (IS_ERR(dev)) {
         pr_alert("pubsub: falhou ao criar o device\n");
         err = PTR_ERR(dev);                          // tira o codigo de erro de dentro do ponteiro
+        kobject_put(pubsub_kobj);                    // desfaz o /sys/pubsub
         class_destroy(cls);                          // desfaz a classe
         cdev_del(&pubsub_cdev);                      // desfaz o cdev_add
         unregister_chrdev_region(devno, DEVCOUNT);   // desfaz o alloc
@@ -543,6 +621,9 @@ static void pubsub_exit(void)
 
     // Libera os tópicos criados
     free_topics();
+
+    // apaga /sys/pubsub (os arquivos dos topicos ja sairam com os topicos)
+    kobject_put(pubsub_kobj);
 
     // desfaz o device (apaga /dev/pubsub), ordem inversa do init
     // assinatura (linux/device.h): void device_destroy(const struct class *cls, dev_t devt);
