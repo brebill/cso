@@ -55,6 +55,9 @@ static LIST_HEAD(topics);
 // chave que protege a lista de topicos (so quem tem a chave mexe nela)
 static DEFINE_MUTEX(topics_lock);
 
+// quantos topicos existem agora (mexer so com o mutex pego)
+static int topic_count = 0;
+
 // procura um topico pelo nome na lista, devolve NULL se nao achar
 static struct topic *find_topic(const char *name)
 {
@@ -91,7 +94,16 @@ static struct topic *create_topic(const char *name)
     INIT_LIST_HEAD(&t->subscribers);                     // lista de inscritos comeca vazia 
 
     list_add_tail(&t->list, &topics);                    // encaixa no fim da lista
+    topic_count++;
     return t;
+}
+
+// tira o topico da lista e devolve a memoria dele (os inscritos ja devem ter saido)
+static void delete_topic(struct topic *t)
+{
+    list_del(&t->list);
+    topic_count--;
+    kfree(t);
 }
 
 // procura um inscrito pelo pid na lista do topico, devolve NULL se nao achar (pid disponivel)
@@ -164,10 +176,8 @@ static int unsubscribe_pid(struct topic *t, pid_t pid)
     if (s == NULL)
         return -ENOENT;
     remove_subscriber(s);
-    if (list_empty(&t->subscribers)) {                   // ultimo inscrito saiu
-        list_del(&t->list);
-        kfree(t);
-    }
+    if (list_empty(&t->subscribers))                     // ultimo inscrito saiu
+        delete_topic(t);
     return 0;
 }
 
@@ -184,8 +194,7 @@ static void free_topics(void)
         list_for_each_entry_safe(s, stmp, &t->subscribers, list)
             remove_subscriber(s);
 
-        list_del(&t->list);                              // tira o topico da lista
-        kfree(t);                                        // devolve a memoria do topico
+        delete_topic(t);
     }
 }
 
@@ -204,7 +213,7 @@ static void print_topics(void)
             pr_info("pubsub:     pid %d\n", s->pid);
         n++;
     }
-    pr_info("pubsub: total %d topico(s)\n", n);
+    pr_info("pubsub: total %d topico(s), contador %d\n", n, topic_count);
 }
 
 
@@ -232,6 +241,11 @@ static struct device *dev = NULL;
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Pedro Oliveira");
 MODULE_DESCRIPTION("T2");
+
+// maximo de topicos existindo ao mesmo tempo (definido na carga: modprobe pubsub max_topicos=2)
+static int max_topicos = 8;
+module_param(max_topicos, int, 0444);        // 0444: so leitura em /sys/module/pubsub/parameters/
+MODULE_PARM_DESC(max_topicos, "Numero maximo de topicos (padrao 8)");
 
 // open: um processo abriu /dev/pubsub (fopen)
 static int pubsub_open(struct inode *inodep, struct file *filep)
@@ -293,6 +307,11 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
         mutex_lock(&topics_lock);                          // pega a chave
         t = find_topic(topico);
         if (t == NULL) {
+            if (topic_count >= max_topicos) {              // ja tem topicos demais: ignora a criacao
+                mutex_unlock(&topics_lock);
+                pr_info("pubsub: limite de %d topico(s), \"%s\" ignorado\n", max_topicos, topico);
+                return len;                                // ignorado em silencio: write devolve sucesso
+            }
             t = create_topic(topico);
             if (t == NULL) {
                 mutex_unlock(&topics_lock);                // devolve a chave antes de sair
@@ -304,10 +323,8 @@ static ssize_t pubsub_write(struct file *filep, const char __user *buffer, size_
 
         if (find_subscriber(t, pid) == NULL) {             // ainda nao esta inscrito
             if (add_subscriber(t, pid) == NULL) {
-                if (created) {                             // nao deixa topico vazio na lista
-                    list_del(&t->list);
-                    kfree(t);
-                }
+                if (created)                               // nao deixa topico vazio na lista
+                    delete_topic(t);
                 mutex_unlock(&topics_lock);                // devolve a chave antes de sair
                 return -ENOMEM;                            // sem memoria
             }
